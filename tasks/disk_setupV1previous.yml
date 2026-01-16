@@ -1,0 +1,90 @@
+---
+- name: Install LVM2 dependencies
+  apt:
+    name: lvm2
+    state: present
+    update_cache: yes
+
+- block:
+    - name: Display Target
+      debug:
+        msg: "Ensuring configuration on: {{ target_disks }}"
+
+    - name: Ensure Volume Group 'mysql_vg' exists
+      community.general.lvg:
+        vg: mysql_vg
+        pvs: "{{ target_disks | join(',') }}"
+        state: present
+        force: yes
+
+    - name: Ensure Fixed Logical Volumes exist
+      community.general.lvol:
+        vg: mysql_vg
+        lv: "{{ item.name }}"
+        size: "{{ item.size }}"
+      loop:
+        - { name: 'lv_logs', size: '3g' }
+        - { name: 'lv_tmp', size: '3g' }
+        - { name: 'lv_gcache', size: '3g' }
+
+    - name: Check if lv_data exists
+      shell: "lvs mysql_vg/lv_data"
+      register: lv_data_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Ensure Data Volume exists (100% Remaining)
+      community.general.lvol:
+        vg: mysql_vg
+        lv: lv_data
+        size: 100%FREE
+      when: lv_data_check.rc != 0
+
+    - name: Ensure Filesystems are formatted (XFS)
+      community.general.filesystem:
+        fstype: xfs
+        dev: "/dev/mysql_vg/{{ item }}"
+      loop:
+        - lv_logs
+        - lv_tmp
+        - lv_gcache
+        - lv_data
+
+    - name: Ensure Mount Points exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: mysql
+        group: mysql
+      loop:
+        - /var/log/mysql
+        - /var/tmp/mysql
+        - /var/lib/galera_cache
+        - /var/lib/mysql
+
+    - name: Ensure Logical Volumes are Mounted
+      mount:
+        path: "{{ item.path }}"
+        src: "/dev/mysql_vg/{{ item.lv }}"
+        fstype: xfs
+        opts: noatime,nodiratime
+        state: mounted
+      loop:
+        - { path: '/var/log/mysql', lv: 'lv_logs' }
+        - { path: '/var/tmp/mysql', lv: 'lv_tmp' }
+        - { path: '/var/lib/galera_cache', lv: 'lv_gcache' }
+        - { path: '/var/lib/mysql', lv: 'lv_data' }
+
+    - name: Set Ownership on Mounted Directories
+      file:
+        path: "{{ item }}"
+        owner: mysql
+        group: mysql
+        mode: '0755'
+        state: directory
+      loop:
+        - /var/log/mysql
+        - /var/tmp/mysql
+        - /var/lib/galera_cache
+        - /var/lib/mysql

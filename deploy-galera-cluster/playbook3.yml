@@ -1,0 +1,147 @@
+---
+- name: Play 1 - WIPE and Prepare (All Nodes)
+  hosts: mariadb_nodes
+  become: true
+  
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+    # --- ADDED THIS BACK ---
+    galera_lib_path: "/usr/lib/libgalera_smm.so"
+    galera_packages:
+      - mariadb-server
+      - galera-4
+      - python3-pymysql
+
+  tasks:
+    - name: 1. Force Stop Any Running MariaDB
+      shell: "pkill -9 mariadbd || true"
+      ignore_errors: true
+
+    - name: 2. DESTROY Existing Data and Logs
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/mysql
+        - /var/log/mysql
+        - /root/.my.cnf
+        - /etc/mysql/mariadb.conf.d/60-mariadb.cnf
+        - /etc/mysql/mariadb.conf.d/99-galera.cnf
+
+    - name: 3. Install Packages
+      apt:
+        name: "{{ galera_packages }}"
+        state: present
+        update_cache: yes
+        install_recommends: no
+
+    - name: 4. Disable AppArmor
+      shell: "ln -s /etc/apparmor.d/usr.sbin.mariadbd /etc/apparmor.d/disable/ || true; apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true"
+      ignore_errors: true
+
+    - name: 5. Create Fresh Directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0755'
+      loop:
+        - /var/lib/mysql
+        - /var/log/mysql
+        - /var/run/mysqld
+
+    - name: 6. Initialize Fresh System Tables
+      command: mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+
+    - name: 7. Deploy Config Files
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/mysql/mariadb.conf.d/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - { src: 'mariadb.cnf.j2', dest: '60-mariadb.cnf' }
+        - { src: 'galera.cnf.j2', dest: '99-galera.cnf' }
+
+    - name: 8. Create Client Config
+      copy:
+        dest: /root/.my.cnf
+        mode: '0600'
+        content: |
+          [client]
+          user=root
+          password="{{ mysql_root_password }}"
+          socket={{ socket_path }}
+
+
+- name: Play 2 - Bootstrap Cluster (Leader Only)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  tasks:
+    - name: Bootstrap the New Cluster
+      command: galera_new_cluster
+    
+    - name: Ensure Leader Service is Active
+      service:
+        name: mariadb
+        state: started
+
+    - name: Wait for Port 3306 (Ready)
+      wait_for:
+        port: 3306
+        timeout: 60
+
+
+- name: Play 3 - Join Followers
+  hosts: "{{ groups['mariadb_nodes'][1:] }}"
+  become: true
+
+  tasks:
+    - name: Start Service (Join Cluster)
+      service:
+        name: mariadb
+        state: started
+
+
+- name: Play 4 - Security Hardening (Leader Only)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+
+  tasks:
+    - block:
+        - name: Set Root Password
+          community.mysql.mysql_user:
+            name: root
+            host: localhost
+            password: "{{ mysql_root_password }}"
+            priv: "*.*:ALL,GRANT"
+            state: present
+          ignore_errors: true 
+
+        - name: Remove Anonymous User
+          community.mysql.mysql_user:
+            name: ""
+            state: absent
+
+        - name: Remove Test Database
+          community.mysql.mysql_db:
+            name: test
+            state: absent
+
+        - name: Create Application User
+          community.mysql.mysql_user:
+            name: "{{ app_user_name }}"
+            password: "{{ app_user_password }}"
+            host: "%"
+            priv: "*.*:ALL"
+            state: present
+
+      module_defaults:
+        community.mysql.mysql_user:
+          login_unix_socket: "{{ socket_path }}"
+        community.mysql.mysql_db:
+          login_unix_socket: "{{ socket_path }}"

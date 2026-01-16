@@ -1,0 +1,285 @@
+---
+- name: Play 1 - Prepare Infrastructure (All Nodes)
+  hosts: all
+  become: true
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+    galera_packages:
+      - mariadb-server
+      - galera-4
+      - python3-pymysql
+
+  tasks:
+    - name: Ensure MySQL Group exists
+      group:
+        name: mysql
+        state: present
+        system: yes
+
+    - name: Ensure MySQL User exists
+      user:
+        name: mysql
+        group: mysql
+        system: yes
+        shell: /bin/false
+        create_home: no
+
+    - name: Identify Root Disk Name
+      set_fact:
+        root_disk_name: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='device') | list | first | regex_replace('/dev/', '') | regex_replace('[0-9]+$', '') }}"
+
+    - name: Find Candidate Data Disks
+      set_fact:
+        target_disks: "{{ target_disks | default([]) + ['/dev/' + item.key] }}"
+      when:
+        - item.key != root_disk_name
+        - not item.key.startswith(('loop', 'ram', 'sr', 'dm'))
+        - item.value.size | human_to_bytes > 5368709120
+      loop: "{{ ansible_devices | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: FORCE WIPE (Clean Slate)
+      block:
+        - name: Stop MariaDB (If running)
+          service:
+            name: mariadb
+            state: stopped
+          ignore_errors: true
+
+        - name: Unmount all MySQL paths
+          mount:
+            path: "{{ item }}"
+            state: unmounted
+          loop: ['/var/lib/mysql', '/var/log/mysql', '/var/tmp/mysql', '/var/lib/galera_cache']
+          ignore_errors: true
+
+        - name: Destroy LVM Groups
+          community.general.lvg:
+            vg: mysql_vg
+            state: absent
+            force: yes
+          ignore_errors: true
+
+        - name: Wipe Raw Disk Signatures
+          command: "wipefs -a {{ item }}"
+          loop: "{{ target_disks }}"
+      when: 
+        - force_wipe | default(false) | bool
+        - target_disks is defined
+
+    - name: Configure Disk and Mounts
+      import_tasks: tasks/disk_setup.yml
+      when: target_disks is defined
+
+    - name: Install MariaDB Packages
+      apt:
+        name: "{{ galera_packages }}"
+        state: present
+        update_cache: yes
+    
+    - name: Initialize System Tables
+      command: mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+      args:
+        creates: /var/lib/mysql/mysql
+
+    - name: Disable AppArmor
+      shell: "ln -s /etc/apparmor.d/usr.sbin.mariadbd /etc/apparmor.d/disable/ || true; apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true"
+      ignore_errors: true
+
+    - name: Stop MariaDB for Configuration
+      service:
+        name: mariadb
+        state: stopped
+    
+    - name: Ensure SSL Directory Exists
+      file:
+        path: /etc/mysql/ssl
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0700'
+
+    - name: Distribute SSL Certificates
+      copy:
+        src: "certs/{{ item }}"
+        dest: "/etc/mysql/ssl/{{ item }}"
+        owner: mysql
+        group: mysql
+        mode: '0600'
+      loop:
+        - ca.pem
+        - server-cert.pem
+        - server-key.pem
+
+    - name: Deploy Cluster Configs
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/mysql/mariadb.conf.d/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - { src: 'mariadb.cnf.j2', dest: '60-mariadb.cnf' }
+        - { src: 'galera.cnf.j2', dest: '99-galera.cnf' }
+      when: inventory_hostname in groups['mariadb_nodes']
+
+    - name: Deploy Async Slave Config
+      copy:
+        dest: /etc/mysql/mariadb.conf.d/50-async-server.cnf
+        content: |
+          [mysqld]
+          server_id={{ 100 + (ansible_default_ipv4.address.split('.')[-1] | int) }}
+          log_bin=mysql-bin
+          binlog_format=row
+          wsrep_on=OFF
+          bind-address=0.0.0.0
+          datadir=/var/lib/mysql
+      when: inventory_hostname in groups['async_node']
+
+- name: Play 2 - Bootstrap Cluster
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+
+  
+  tasks:
+    - name: Force Galera Safe-To-Bootstrap
+      lineinfile:
+        path: /var/lib/mysql/grastate.dat
+        regexp: '^safe_to_bootstrap:'
+        line: 'safe_to_bootstrap: 1'
+      ignore_errors: true 
+
+    - name: Bootstrap Cluster
+      command: galera_new_cluster
+
+    - name: Wait for Leader Ready
+      wait_for:
+        port: 3306
+        timeout: 60
+
+- name: Play 3 - Join Cluster
+  hosts: "{{ groups['mariadb_nodes'][1:] }}"
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Clean Stale Galera State (If corrupted)
+      file:
+        path: "/var/lib/mysql/{{ item }}"
+        state: absent
+      loop:
+        - grastate.dat
+        - gvwstate.dat
+        - tc.log
+      ignore_errors: true
+
+    - name: Start MariaDB (Join Cluster)
+      service:
+        name: mariadb
+        state: started
+
+    - name: Wait for Node to Sync
+      community.mysql.mysql_query:
+        query: "SHOW STATUS LIKE 'wsrep_local_state_comment'"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      register: sync_status
+      until: >
+        sync_status.query_result is defined and
+        sync_status.query_result | length > 0 and
+        sync_status.query_result[0][0].Value == 'Synced'
+      retries: 60
+      delay: 10
+      ignore_errors: yes
+
+- name: Play 4 - Security & Master Setup
+  hosts: "{{ groups['mariadb_nodes'][2] }}"
+  become: true
+  
+  tasks:
+    - name: Set Root Password
+      community.mysql.mysql_user:
+        name: root
+        host: localhost
+        password: "{{ mysql_root_password }}"
+        priv: "*.*:ALL,GRANT"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Remove Anonymous Users
+      community.mysql.mysql_user:
+        name: ""
+        state: absent
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create Replication User
+      community.mysql.mysql_user:
+        name: repl_user
+        password: "{{ mysql_root_password }}"
+        host: "%"
+        priv: "*.*:REPLICATION SLAVE"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Get Master Coordinates
+      community.mysql.mysql_replication:
+        mode: getprimary
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      register: master_status
+
+
+- name: Play 5 - Configure Async Slave
+  hosts: "{{ groups['async_node'] }}"
+  become: true
+
+  tasks:
+    - name: Start MariaDB
+      service:
+        name: mariadb
+        state: started
+
+    - name: Stop Replication (To Allow Config Change)
+      community.mysql.mysql_replication:
+        mode: stopreplica
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      ignore_errors: true 
+
+    - name: Configure Replication Source
+      community.mysql.mysql_replication:
+        mode: changeprimary
+        primary_host: "{{ groups['mariadb_nodes'][2] }}"
+        primary_user: repl_user
+        primary_password: "{{ mysql_root_password }}"
+        primary_log_file: "{{ hostvars[groups['mariadb_nodes'][2]]['master_status']['File'] }}"
+        primary_log_pos: "{{ hostvars[groups['mariadb_nodes'][2]]['master_status']['Position'] }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      when: hostvars[groups['mariadb_nodes'][2]]['master_status'] is defined       
+
+
+    - name: Start Replication
+      community.mysql.mysql_replication:
+        mode: startreplica
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+    - name: Verify Replication Started
+      community.mysql.mysql_replication:
+        mode: getreplica
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      register: slave_status
+      failed_when: 
+        - slave_status.Slave_IO_Running != "Yes"
+        - slave_status.Slave_SQL_Running != "Yes"
+      retries: 3
+      delay: 5
+
+- name: Play 6 - Verify Cluster Health
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+
+  tasks:
+    - name: Check Cluster Size
+      community.mysql.mysql_query:
+        query: "SHOW STATUS LIKE 'wsrep_cluster_size'"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      register: final_size
+
+    - name: Display Result
+      debug:
+        msg: "✓ Cluster deployed with {{ final_size.query_result[0][0].Value }}/{{ groups['mariadb_nodes'] | length }} nodes"

@@ -1,0 +1,16 @@
+{
+  "sql_final_config": {
+    "user": "mysql",
+    "port": "3306",
+    "max_connections": "888",
+    "innodb_buffer_pool_size": "256M"
+  },
+  "galera_final_config": {
+    "wsrep_cluster_name": "test-cluster-v1",
+    "wsrep_on": "ON"
+  },
+  "wsrep_provider_options_string": "gcache.size=256M;gcache.recover=ON",
+  "mysql_root_password": "TestPassword999!",
+  "app_user_name": "test_app_user",
+  "app_user_password": "TestAppPass000!"
+}

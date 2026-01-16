@@ -1,0 +1,185 @@
+---
+- name: Play 1 - Infrastructure, Config & Rolling Updates (All Nodes)
+  hosts: mariadb_nodes
+  become: true
+  serial: 1
+
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+    galera_lib_path: "/usr/lib/libgalera_smm.so"
+    galera_packages:
+      - mariadb-server
+      - galera-4
+      - python3-pymysql
+
+  tasks:
+    - name: Install Packages
+      apt:
+        name: "{{ galera_packages }}"
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+        install_recommends: no
+
+    - name: Disable AppArmor (Ubuntu Specific Fix)
+      shell: "ln -s /etc/apparmor.d/usr.sbin.mariadbd /etc/apparmor.d/disable/ || true; apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true"
+      ignore_errors: true
+
+    - name: Create Client Config (.my.cnf) on ALL Nodes
+      copy:
+        dest: /root/.my.cnf
+        mode: '0600'
+        content: |
+          [client]
+          user=root
+          password="{{ mysql_root_password }}"
+          socket={{ socket_path }}
+
+    - name: Check if MariaDB is initialized (Day 1 vs Day 2)
+      stat:
+        path: /var/lib/mysql/mysql
+      register: db_installed
+
+    - block:
+        - name: Force Kill Stuck Processes
+          shell: "pkill -9 mariadbd || true"
+          ignore_errors: true
+
+        - name: Wipe Data and Log Directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /var/lib/mysql
+            - /var/log/mysql
+
+        - name: Re-Create Directory Structure
+          file:
+            path: "{{ item }}"
+            state: directory
+            owner: mysql
+            group: mysql
+            mode: '0755'
+          loop: 
+            - /var/lib/mysql
+            - /var/log/mysql
+            - /var/run/mysqld
+
+        - name: Initialize System Tables
+          command: mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+
+      when: not db_installed.stat.exists
+
+    - name: Deploy Configurations
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/mysql/mariadb.conf.d/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - { src: 'mariadb.cnf.j2', dest: '60-mariadb.cnf' }
+        - { src: 'galera.cnf.j2', dest: '99-galera.cnf' }
+      # If configs change on Day 2, trigger the Rolling Restart
+      notify: Restart MariaDB
+
+  handlers:
+    - name: Restart MariaDB
+      block:
+        - name: Restart Service
+          service:
+            name: mariadb
+            state: restarted
+
+        - name: Wait for Node to Rejoin Cluster
+          shell: mysql -u root --socket={{ socket_path }} -e "SHOW STATUS LIKE 'wsrep_local_state_comment';"
+          register: node_status
+          until: node_status.stdout.find("Synced") != -1
+          retries: 60
+          delay: 5
+          changed_when: false
+      
+      when: db_installed.stat.exists
+
+
+- name: Play 2 - Cluster Bootstrap (Leader Node)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  tasks:
+    - name: Check if MariaDB is active
+      command: pgrep -x mariadbd
+      register: mariadb_running
+      ignore_errors: true
+      changed_when: false
+
+    - name: Reset Systemd Failed State
+      command: systemctl reset-failed mariadb
+      when: mariadb_running.rc != 0
+      ignore_errors: true
+
+    - name: Bootstrap Cluster
+      command: galera_new_cluster
+      register: bootstrap
+      failed_when: bootstrap.rc != 0 and 'Address already in use' not in bootstrap.stderr
+      when: mariadb_running.rc != 0
+
+    - name: Ensure Service Started
+      service: name=mariadb state=started
+
+    - name: Wait for TCP Port 3306
+      wait_for: port=3306 timeout=60
+
+
+- name: Play 3 - Join Cluster (Follower Nodes)
+  hosts: "{{ groups['mariadb_nodes'][1:] }}"
+  become: true
+
+  tasks:
+    - name: Reset Systemd
+      command: systemctl reset-failed mariadb
+      ignore_errors: true
+
+    - name: Start Service (Join)
+      service: name=mariadb state=started
+
+
+- name: Play 4 - Security Hardening (Leader Node)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+
+  tasks:
+    - block:
+        - name: Set Root Password
+          community.mysql.mysql_user:
+            name: root
+            host: localhost
+            password: "{{ mysql_root_password }}"
+            priv: "*.*:ALL,GRANT"
+            state: present
+          ignore_errors: true 
+
+        - name: Remove Anonymous User
+          community.mysql.mysql_user:
+            name: ""
+            state: absent
+
+        - name: Remove Test Database
+          community.mysql.mysql_db:
+            name: test
+            state: absent
+
+        - name: Create Application User
+          community.mysql.mysql_user:
+            name: "{{ app_user_name }}"
+            password: "{{ app_user_password }}"
+            host: "%"
+            priv: "*.*:ALL"
+            state: present
+
+      module_defaults:
+        community.mysql.mysql_user:
+          login_unix_socket: "{{ socket_path }}"
+        community.mysql.mysql_db:
+          login_unix_socket: "{{ socket_path }}"

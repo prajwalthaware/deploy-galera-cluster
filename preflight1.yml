@@ -1,0 +1,183 @@
+---
+# Preflight Connectivity and Resource Check Playbook
+# This playbook validates infrastructure readiness before Galera deployment
+# Run time: ~30 seconds
+# Non-destructive: Only reads system information, does not modify anything
+
+- name: Preflight - Connectivity and Resource Validation
+  hosts: all
+  gather_facts: yes
+  become: true
+  vars:
+    min_ram_mb: 1024
+    min_disk_gb: 10
+    preflight_status: "SUCCESS"
+    preflight_errors: []
+  
+  tasks:
+    # ===== CONNECTIVITY CHECK =====
+    - name: Test SSH Connectivity
+      ping:
+      register: ping_result
+      failed_when: false
+
+    - name: Record SSH Failure
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['SSH connection test failed'] }}"
+      when: ping_result is failed
+
+    # ===== RAM CHECK =====
+    - name: Check Minimum RAM
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['Insufficient RAM: ' + (ansible_memtotal_mb | string) + 'MB (minimum 2048MB required)'] }}"
+      when: 
+        - ansible_memtotal_mb < min_ram_mb
+        - ping_result is succeeded
+
+    # ===== DISK DISCOVERY =====
+    - name: Identify Root Disk Name
+      set_fact:
+        root_disk_name: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='device') | list | first | regex_replace('/dev/', '') | regex_replace('[0-9]+$', '') }}"
+      when: ping_result is succeeded
+
+    - name: Find Candidate Data Disks
+      set_fact:
+        candidate_disks: "{{ candidate_disks | default([]) + [item] }}"
+      when:
+        - ping_result is succeeded
+        - item.key != root_disk_name
+        - not item.key.startswith(('loop', 'ram', 'sr', 'dm'))
+        - item.value.size | human_to_bytes > 5368709120  # > 5GB
+      loop: "{{ ansible_devices | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Calculate Total Available Disk Space
+      set_fact:
+        total_disk_gb: "{{ ((candidate_disks | default([]) | map(attribute='value.size') | map('human_to_bytes') | sum) / 1073741824) | round(2) }}"
+      when: 
+        - ping_result is succeeded
+        - candidate_disks is defined
+
+    - name: Set Disk Space to Zero if No Disks Found
+      set_fact:
+        total_disk_gb: 0
+      when: candidate_disks is not defined or candidate_disks | length == 0
+
+    # ===== DISK SPACE CHECK =====
+    - name: Check Minimum Disk Space
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['Insufficient disk space: ' + (total_disk_gb | string) + 'GB available (minimum 10GB required)'] }}"
+      when: 
+        - ping_result is succeeded
+        - total_disk_gb | float < min_disk_gb
+
+    # ===== BUILD PREFLIGHT REPORT =====
+    - name: Build Node Preflight Report
+      set_fact:
+        node_report:
+          hostname: "{{ ansible_hostname }}"
+          ip: "{{ ansible_default_ipv4.address }}"
+          status: "{{ preflight_status }}"
+          ram_mb: "{{ ansible_memtotal_mb }}"
+          available_disk_gb: "{{ total_disk_gb }}"
+          disk_count: "{{ candidate_disks | default([]) | length }}"
+          errors: "{{ preflight_errors }}"
+      when: ping_result is succeeded
+
+    - name: Build Failed Node Report
+      set_fact:
+        node_report:
+          hostname: "{{ inventory_hostname }}"
+          ip: "{{ inventory_hostname }}"
+          status: "FAILED"
+          errors: ["SSH connection failed - unable to reach host"]
+      when: ping_result is failed
+
+    - name: Display Node Report
+      debug:
+        var: node_report
+
+    - name: Save Report to Local File
+      copy:
+        content: "{{ node_report | to_json }}"
+        dest: "/tmp/preflight_{{ inventory_hostname }}.json"
+      delegate_to: localhost
+      become: false
+
+# ===== AGGREGATE AND SEND RESULTS =====
+- name: Aggregate Results and Send to Backend
+  hosts: localhost
+  gather_facts: no
+  vars:
+    backend_url: "http://192.168.56.1:3000"
+  
+  tasks:
+    - name: Collect All Node Reports
+      shell: |
+        python3 -c "
+        import json
+        import glob
+        reports = []
+        for f in sorted(glob.glob('/tmp/preflight_*.json')):
+            with open(f) as fp:
+                reports.append(json.load(fp))
+        print(json.dumps(reports))
+        "
+      register: all_reports_raw
+      changed_when: false
+
+    - name: Parse All Reports
+      set_fact:
+        all_nodes: "{{ all_reports_raw.stdout | from_json }}"
+
+    - name: Determine Overall Status
+      set_fact:
+        overall_status: "{% if all_nodes | selectattr('status', 'equalto', 'FAILED') | list | length > 0 %}FAILED{% else %}SUCCESS{% endif %}"
+
+    - name: Build Error Summary
+      set_fact:
+        error_summary: "{{ all_nodes | selectattr('status', 'equalto', 'FAILED') | map(attribute='errors') | flatten | join('; ') }}"
+      when: overall_status == 'FAILED'
+
+    - name: Display Overall Results
+      debug:
+        msg: 
+          - "Preflight Status: {{ overall_status }}"
+          - "Nodes Checked: {{ all_nodes | length }}"
+          - "Failed Nodes: {{ all_nodes | selectattr('status', 'equalto', 'FAILED') | list | length }}"
+
+    - name: POST Results to Backend
+      uri:
+        url: "{{ backend_url }}/api/preflight/{{ preflight_id }}/complete"
+        method: POST
+        body_format: json
+        body:
+          status: "{{ overall_status }}"
+          results: "{{ all_nodes }}"
+          error_message: "{{ error_summary | default('') }}"
+        status_code: [200, 201]
+        timeout: 10
+      register: webhook_response
+      failed_when: false
+
+    - name: Display Webhook Result
+      debug:
+        msg: "Webhook response: {{ webhook_response.status }}"
+
+    - name: Cleanup Temporary Files
+      file:
+        path: "/tmp/preflight_{{ item }}.json"
+        state: absent
+      loop: "{{ groups['all'] }}"
+      ignore_errors: true
+      become: false
+
+    - name: Fail Playbook if Preflight Failed
+      fail:
+        msg: "Preflight checks failed. See results above."
+      when: overall_status == 'FAILED'
+

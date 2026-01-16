@@ -1,0 +1,36 @@
+[mysqld]
+
+datadir = /var/lib/mysql
+tmpdir  = /var/tmp/mysql
+
+
+# 1. Loop through the JSON parameters from Jenkins
+{% for key, value in galera_final_config.items() %}
+{% if key != 'wsrep_provider' %}
+{{ key }} = {{ value }}
+{% endif %}
+{% endfor %}
+
+
+# 2. Hardcoded / Template specific settings
+wsrep_provider = {{ galera_final_config.wsrep_provider | default('/usr/lib/libgalera_smm.so') }}
+#wsrep_provider_options = "gcache.dir=/var/lib/galera_cache;{{ wsrep_provider_options_string }}"
+
+binlog_format = ROW
+default_storage_engine = InnoDB
+innodb_autoinc_lock_mode = 2
+wsrep_slave_threads = {{ (ansible_processor_vcpus * 4) | int }}
+
+wsrep_node_address = {{ inventory_hostname }}
+wsrep_node_name = {{ ansible_hostname }}
+wsrep_cluster_address = "gcomm://{% for host in groups['mariadb_nodes'] %}{{ host }}{% if not loop.last %},{% endif %}{% endfor %}"
+
+# 3. Replication Settings (Required for the Async Slave to work)
+log_bin=mysql-bin
+log_slave_updates=1
+# This ID generation is safe and unique per IP
+
+server_id={{ 100 + (ansible_default_ipv4.address.split('.')[-1] | int) }}
+
+
+wsrep_provider_options = "gcache.dir=/var/lib/galera_cache;socket.ssl_key=/etc/mysql/ssl/server-key.pem;socket.ssl_cert=/etc/mysql/ssl/server-cert.pem;socket.ssl_ca=/etc/mysql/ssl/ca.pem;{{ wsrep_provider_options_string }};gcache.name=/var/lib/galera_cache/galera.cache"

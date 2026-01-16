@@ -1,0 +1,265 @@
+---
+- name: Play 1 - Prepare and Configure (All Nodes)
+  hosts: all
+  become: true
+  
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+    galera_packages:
+      - mariadb-server
+      - galera-4
+      - python3-pymysql
+
+  tasks:
+    - name: Identify Root Disk
+      shell: lsblk -no pkname $(findmnt -n -o SOURCE /)
+      register: root_disk_check
+      changed_when: false
+
+    - name: Find Safe Candidate Disks
+      set_fact:
+        target_disks: "{{ target_disks | default([]) + ['/dev/' + item.key] }}"
+      when:
+        - item.key != root_disk_check.stdout          # Not Root
+        - not item.key.startswith('loop')             # Not Loopback
+        - not item.key.startswith('ram')              # Not RAM disk
+        - not item.key.startswith('sr')               # Not CD-ROM
+        - item.value.size | human_to_bytes > 5368709120 # > 5GB
+      loop: "{{ ansible_devices | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} ({{ item.value.size }})"
+
+    - name: Safety Check - No Disks Found
+      fail:
+        msg: "No valid data disks > 5GB found."
+      when: target_disks is not defined
+    
+    - name: FORCE WIPE (Clean Slate)
+      block:
+        - name: Notify User
+          debug:
+            msg: "FORCE WIPE ENABLED! Destroying data on {{ target_disks }}..."
+
+        - name: Kill Processes
+          shell: |
+            systemctl stop mariadb || true
+            pkill -9 mariadbd || true
+            fuser -k -m /var/lib/mysql || true
+          ignore_errors: true
+        
+        - name: Unmount Everything
+          shell: "umount -l /var/lib/mysql /var/log/mysql /var/tmp/mysql /var/lib/galera_cache || true"
+          ignore_errors: true
+
+        - name: Destroy LVM Groups
+          community.general.lvg:
+            vg: mysql_vg
+            state: absent
+            force: yes
+          ignore_errors: true
+
+        - name: Wipe Raw Disk Signatures
+          shell: "wipefs -a {{ item }} || true"
+          loop: "{{ target_disks }}"
+      
+      # The Logic: Run if variable is defined AND true. Default is False.
+      when: force_wipe | default(false) | bool      
+
+    # Calls the external task file to handle LVM and Mounts safely
+    - name: 1. Configure Disk and Mounts (Smart Mode)
+      import_tasks: tasks/disk_setup.yml
+      when: target_disks is defined
+
+    # --- PHASE 2: INSTALLATION ---
+    - name: 2. Install Packages
+      apt:
+        name: "{{ galera_packages }}"
+        state: present
+        update_cache: yes
+        install_recommends: no
+
+    - name: 3. Disable AppArmor
+      shell: "ln -s /etc/apparmor.d/usr.sbin.mariadbd /etc/apparmor.d/disable/ || true; apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true"
+      ignore_errors: true
+
+    - name: 4. Set Directory Permissions
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: '0755'
+      loop:
+        - /var/lib/mysql
+        - /var/log/mysql
+        - /var/tmp/mysql
+        - /var/lib/galera_cache
+        - /var/run/mysqld
+
+    - name: 5. Initialize System Tables
+      # CRITICAL SAFETY: Only runs if the DB does not exist yet
+      command: mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+      args:
+        creates: /var/lib/mysql/mysql
+
+    - name: 6a. Deploy Galera Configs
+      template:
+        src: "templates/{{ item.src }}"
+        dest: "/etc/mysql/mariadb.conf.d/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - { src: 'mariadb.cnf.j2', dest: '60-mariadb.cnf' }
+        - { src: 'galera.cnf.j2', dest: '99-galera.cnf' }
+      when: inventory_hostname in groups['mariadb_nodes']
+
+    - name: 6b. Deploy Async Slave Config
+      copy:
+        dest: /etc/mysql/mariadb.conf.d/50-async-server.cnf
+        content: |
+          [mysqld]
+          server_id={{ 100 + (ansible_default_ipv4.address.split('.')[-1] | int) }}
+          log_bin=mysql-bin
+          binlog_format=row
+          wsrep_on=OFF
+          bind-address=0.0.0.0
+          datadir=/var/lib/mysql
+          tmpdir=/var/tmp/mysql
+      when: inventory_hostname in groups['async_node']
+
+    - name: 7. Create Client Config
+      copy:
+        dest: /root/.my.cnf
+        mode: '0600'
+        content: |
+          [client]
+          user=root
+          password="{{ mysql_root_password }}"
+          socket={{ socket_path }}
+
+    - name: 8. Start Async Node Service
+      service:
+        name: mariadb
+        state: started
+      when: inventory_hostname in groups['async_node']
+
+
+- name: Play 2 - Bootstrap Cluster (Leader Only)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  tasks:
+    - name: Bootstrap the New Cluster
+      command: galera_new_cluster
+      # Only bootstrap if not already running
+      register: bootstrap_cmd
+      changed_when: bootstrap_cmd.rc == 0
+      failed_when: false 
+    
+    - name: Ensure Leader Service is Active
+      service:
+        name: mariadb
+        state: started
+
+    - name: Wait for Port 3306 (Ready)
+      wait_for:
+        port: 3306
+        timeout: 60
+
+
+- name: Play 3 - Join Followers
+  hosts: "{{ groups['mariadb_nodes'][1:] }}"
+  become: true
+
+  tasks:
+    - name: Start Service (Join Cluster)
+      service:
+        name: mariadb
+        state: started
+
+
+- name: Play 4 - Security Hardening (Leader Only)
+  hosts: "{{ groups['mariadb_nodes'][0] }}"
+  become: true
+  
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+
+  tasks:
+    - block:
+        - name: Set Root Password
+          community.mysql.mysql_user:
+            name: root
+            host: localhost
+            password: "{{ mysql_root_password }}"
+            priv: "*.*:ALL,GRANT"
+            state: present
+          ignore_errors: true 
+
+        - name: Remove Anonymous User
+          community.mysql.mysql_user:
+            name: ""
+            state: absent
+
+        - name: Remove Test Database
+          community.mysql.mysql_db:
+            name: test
+            state: absent
+
+        - name: Create Application User
+          community.mysql.mysql_user:
+            name: "{{ app_user_name }}"
+            password: "{{ app_user_password }}"
+            host: "%"
+            priv: "*.*:ALL"
+            state: present
+
+      module_defaults:
+        community.mysql.mysql_user:
+          login_unix_socket: "{{ socket_path }}"
+        community.mysql.mysql_db:
+          login_unix_socket: "{{ socket_path }}"
+
+
+- name: Play 5 - Setup Async Replication
+  hosts: all
+  become: true
+  vars:
+    socket_path: "/var/run/mysqld/mysqld.sock"
+
+  tasks:
+    - name: Create Replication User (On Leader)
+      community.mysql.mysql_user:
+        name: repl_user
+        password: "{{ mysql_root_password }}"
+        host: "%"
+        priv: "*.*:REPLICATION SLAVE"
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        login_unix_socket: "{{ socket_path }}"
+      when: inventory_hostname == groups['mariadb_nodes'][0]
+   
+    - name: Restart MariaDB to Force Log Initialization
+      service:
+        name: mariadb
+        state: restarted
+      when: inventory_hostname in groups['async_node']
+
+    - name: Configure Replica (Async Node)
+      community.mysql.mysql_replication:
+        mode: changeprimary            
+        primary_host: "{{ groups['mariadb_nodes'][0] }}" 
+        primary_user: repl_user      
+        primary_password: "{{ mysql_root_password }}" 
+        primary_auto_position: no        
+        primary_log_file: mysql-bin.000001
+        primary_log_pos: 4       
+        login_unix_socket: "{{ socket_path }}"
+      ignore_errors: true
+      when: inventory_hostname in groups['async_node']
+
+    - name: Start Replica
+      community.mysql.mysql_replication:
+        mode: startreplica       
+        login_unix_socket: "{{ socket_path }}"
+      when: inventory_hostname in groups['async_node']

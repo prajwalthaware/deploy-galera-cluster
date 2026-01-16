@@ -1,0 +1,149 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'TARGET_HOSTS', description: 'Comma separated Galera node IPs (3 nodes)')
+        string(name: 'ASYNC_HOST', description: 'Async slave node IP')
+        string(name: 'PREFLIGHT_ID', description: 'Preflight ID from backend')
+    }
+
+    environment {
+        SSH_KEY_PATH = '/var/lib/jenkins/.ssh/ansible_key'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+        BACKEND_URL = 'http://192.168.56.1:3000'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "✓ Repository checked out to workspace: ${env.WORKSPACE}"
+                sh 'ls -la'
+            }
+        }
+
+        stage('Generate Inventory') {
+            steps {
+                script {
+                    echo "Generating Ansible inventory for preflight checks..."
+                    
+                    def galeraIps = params.TARGET_HOSTS.split(',')
+                    
+                    // Create inventory file
+                    sh "echo '[mariadb_nodes]' > inventory_preflight.ini"
+                    for (ip in galeraIps) {
+                        sh "echo '${ip.trim()}' >> inventory_preflight.ini"
+                    }
+                    
+                    sh "echo '' >> inventory_preflight.ini"
+                    sh "echo '[async_node]' >> inventory_preflight.ini"
+                    sh "echo '${params.ASYNC_HOST}' >> inventory_preflight.ini"
+                    
+                    sh """
+                        echo '' >> inventory_preflight.ini
+                        echo '[all:vars]' >> inventory_preflight.ini
+                        echo 'ansible_user=user' >> inventory_preflight.ini
+                        echo 'ansible_ssh_private_key_file=${SSH_KEY_PATH}' >> inventory_preflight.ini
+                        echo 'ansible_python_interpreter=/usr/bin/python3.10' >> inventory_preflight.ini
+                        echo 'preflight_id=${params.PREFLIGHT_ID}' >> inventory_preflight.ini
+                    """
+                    
+                    // Display inventory for debugging
+                    echo "Generated inventory:"
+                    sh "cat inventory_preflight.ini"
+                }
+            }
+        }
+
+        stage('Run Preflight Checks') {
+            steps {
+                script {
+                    echo "Running preflight checks on ${params.TARGET_HOSTS} and ${params.ASYNC_HOST}..."
+                    
+                    try {
+                        sh """
+                            sudo -E ansible-playbook -i inventory_preflight.ini test2_preflight.yml \
+                            --extra-vars "preflight_id=${params.PREFLIGHT_ID}"
+                        """
+                    } catch (Exception e) {
+                        // Preflight playbook will handle sending failure to backend
+                        echo "Preflight checks failed: ${e.message}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Preflight checks completed successfully!"
+            echo "Preflight ID: ${params.PREFLIGHT_ID}"
+            echo "All nodes validated and ready for deployment"
+        }
+        failure {
+            echo "❌ Preflight checks failed!"
+            echo "Preflight ID: ${params.PREFLIGHT_ID}"
+            echo "Jenkins Build: ${env.BUILD_NUMBER}"
+            
+            // Notify backend of failure ONLY if Ansible didn't already send results
+            script {
+                try {
+                    // First, check if results were already sent by Ansible
+                    // Use Python to parse JSON reliably (avoid shell escaping issues)
+                    def checkStatus = sh(
+                        script: """#!/bin/bash
+                            response=\$(curl -s '${BACKEND_URL}/api/preflight/${params.PREFLIGHT_ID}')
+                            echo "\$response" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('status', 'UNKNOWN'))"
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Current preflight status in database: ${checkStatus}"
+                    
+                    // Only update if still RUNNING or check failed (Ansible didn't complete)
+                    if (checkStatus == "RUNNING" || checkStatus == "UNKNOWN" || checkStatus == "") {
+                        echo "Status is '${checkStatus}' - sending failure notification to backend..."
+                        
+                        def response = sh(
+                            script: """#!/bin/bash
+                                curl -X POST '${BACKEND_URL}/api/preflight/${params.PREFLIGHT_ID}/complete' \\
+                                -H 'Content-Type: application/json' \\
+                                -d '{"status":"FAILED","results":[],"error_message":"Jenkins Build #${env.BUILD_NUMBER} failed during preflight execution. Common causes: SSH connectivity issues, missing dependencies, or infrastructure problems. Check Jenkins console for details."}' \\
+                                -w '%{http_code}' -o /dev/null -s
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (response == "200" || response == "201") {
+                            echo "✓ Backend notified of preflight failure (HTTP ${response})"
+                        } else {
+                            echo "⚠ Backend notification returned HTTP ${response}"
+                        }
+                    } else if (checkStatus == "FAILED" || checkStatus == "SUCCESS") {
+                        echo "✓ Ansible already sent results (status: ${checkStatus}) - skipping duplicate notification"
+                    } else {
+                        echo "⚠ Unexpected status '${checkStatus}' - attempting to send failure anyway..."
+                        sh """#!/bin/bash
+                            curl -X POST '${BACKEND_URL}/api/preflight/${params.PREFLIGHT_ID}/complete' \\
+                            -H 'Content-Type: application/json' \\
+                            -d '{"status":"FAILED","results":[],"error_message":"Jenkins Build #${env.BUILD_NUMBER} failed. Status check returned: ${checkStatus}"}' \\
+                            -s -o /dev/null
+                        """
+                    }
+                } catch (Exception e) {
+                    echo "⚠ Failed to notify backend: ${e.message}"
+                    echo "Note: User will see timeout in UI after 3 minutes as fallback"
+                }
+            }
+            
+            echo "Check the results in the backend UI for detailed error information"
+        }
+        always {
+            echo "Cleaning up temporary files..."
+            sh 'rm -f inventory_preflight.ini'
+            // Temp files cleanup handled by Ansible playbook
+        }
+    }
+}
+

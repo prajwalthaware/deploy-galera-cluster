@@ -1,0 +1,24 @@
+[galera]
+{% for key, value in galera_final_config.items() %}
+{% if key != 'wsrep_provider' %}
+{{ key }} = {{ value }}
+{% endif %}
+{% endfor %}
+
+wsrep_provider = {{ galera_final_config.wsrep_provider | default(galera_lib_path) }}
+wsrep_provider_options = "{{ wsrep_provider_options_string }}"
+
+binlog_format = ROW
+default_storage_engine = InnoDB
+innodb_autoinc_lock_mode = 2
+wsrep_slave_threads = {{ (ansible_processor_vcpus * 4) | int }}
+
+wsrep_node_address = {{ inventory_hostname }}
+wsrep_node_name = {{ ansible_hostname }}
+wsrep_cluster_address = "gcomm://{% for host in groups['mariadb_nodes'] %}{{ host }}{% if not loop.last %},{% endif %}{% endfor %}"
+
+
+[mysqld]
+log_bin=mysql-bin
+log_slave_updates=1
+server_id={{ 100 + (ansible_default_ipv4.address.split('.')[-1] | int) }} 
