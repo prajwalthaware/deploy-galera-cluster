@@ -1,7 +1,8 @@
 [mysqld]
 {% for key, value in sql_final_config.items() %}
 {{ key }} = {{ value }}
+{% endfor %}
 ssl-ca=/etc/mysql/ssl/ca.pem
 ssl-cert=/etc/mysql/ssl/server-cert.pem
 ssl-key=/etc/mysql/ssl/server-key.pem
-{% endfor %}
+
